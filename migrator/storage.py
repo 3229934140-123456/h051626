@@ -33,6 +33,27 @@ class AppliedMigration:
         return f"AppliedMigration(version='{self.version}', status={status})"
 
 
+@dataclass
+class MigrationHistory:
+    """迁移执行历史 (每次 up/down 追加一条, 不做更新删除)"""
+
+    id: int
+    version: MigrationVersion
+    name: str
+    direction: str
+    status: str
+    executed_at: datetime
+    execution_time_ms: int
+    checksum: Optional[str]
+    source: Optional[str]
+
+    def __repr__(self) -> str:
+        return (
+            f"MigrationHistory(id={self.id}, version={self.version}, "
+            f"direction={self.direction}, status={self.status})"
+        )
+
+
 class MigrationStorage:
     """
     迁移状态存储
@@ -42,6 +63,7 @@ class MigrationStorage:
 
     SCHEMA_MIGRATIONS_TABLE = "schema_migrations"
     MIGRATION_LOCK_TABLE = "schema_migrations_lock"
+    MIGRATION_HISTORY_TABLE = "schema_migrations_history"
     LOCK_ID = 1
 
     def __init__(self, connection):
@@ -72,6 +94,9 @@ class MigrationStorage:
 
             # 创建锁表
             self._create_lock_table(cursor, dialect)
+
+            # 创建历史表
+            self._create_history_table(cursor, dialect)
 
             # 初始化锁记录
             self._init_lock_record(cursor, dialect)
@@ -178,6 +203,86 @@ class MigrationStorage:
             )
             """
             cursor.execute(create_table)
+
+    def _create_history_table(self, cursor, dialect: str) -> None:
+        """创建 schema_migrations_history 审计表 (只追加不更新)"""
+        q = "`" if dialect == "mysql" else '"'
+        table = f"{q}{self.MIGRATION_HISTORY_TABLE}{q}"
+        seq_expr = ""
+        pk_type = ""
+
+        if dialect == "mysql":
+            pk_type = "`id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"
+        elif dialect == "postgresql":
+            pk_type = "id BIGSERIAL PRIMARY KEY"
+        else:
+            pk_type = "id INTEGER PRIMARY KEY AUTOINCREMENT"
+
+        if dialect == "mysql":
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                {pk_type},
+                `version` VARCHAR(64) NOT NULL,
+                `name` VARCHAR(255) NOT NULL,
+                `direction` VARCHAR(8) NOT NULL,
+                `status` VARCHAR(16) NOT NULL,
+                `executed_at` DATETIME NOT NULL,
+                `execution_time` INT NOT NULL DEFAULT 0,
+                `checksum` CHAR(64),
+                `source` VARCHAR(255),
+                INDEX `idx_history_version` (`version`),
+                INDEX `idx_history_executed_at` (`executed_at`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+            cursor.execute(create_table)
+
+        elif dialect == "postgresql":
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                {pk_type},
+                version VARCHAR(64) NOT NULL,
+                name VARCHAR(255) NOT NULL,
+                direction VARCHAR(8) NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                executed_at TIMESTAMP NOT NULL,
+                execution_time INTEGER NOT NULL DEFAULT 0,
+                checksum CHAR(64),
+                source VARCHAR(255)
+            )
+            """
+            cursor.execute(create_table)
+            create_idx1 = f"""
+            CREATE INDEX IF NOT EXISTS idx_{self.MIGRATION_HISTORY_TABLE}_version
+                ON {table} (version)
+            """
+            cursor.execute(create_idx1)
+            create_idx2 = f"""
+            CREATE INDEX IF NOT EXISTS idx_{self.MIGRATION_HISTORY_TABLE}_executed_at
+                ON {table} (executed_at)
+            """
+            cursor.execute(create_idx2)
+
+        else:
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
+                {pk_type},
+                version TEXT NOT NULL,
+                name TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                status TEXT NOT NULL,
+                executed_at TIMESTAMP NOT NULL,
+                execution_time INTEGER NOT NULL DEFAULT 0,
+                checksum TEXT,
+                source TEXT
+            )
+            """
+            cursor.execute(create_table)
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_history_version ON {table} (version)"
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_history_executed_at ON {table} (executed_at)"
+            )
 
     def _init_lock_record(self, cursor, dialect: str) -> None:
         """确保锁表中有一条初始记录"""
@@ -484,6 +589,119 @@ class MigrationStorage:
                 )
 
         return errors
+
+    # ------------------------------------------------------------------
+    # 审计历史 (只追加不更新删除)
+    # ------------------------------------------------------------------
+
+    def record_history(
+        self,
+        version: MigrationVersion,
+        name: str,
+        direction: str,
+        status: str,
+        execution_time_ms: int,
+        checksum: Optional[str] = None,
+        source: Optional[str] = None,
+    ) -> None:
+        """
+        追加一条迁移历史记录。
+
+        Args:
+            direction: 'up' 或 'down'
+            status: 'success' 或 'failed'
+        """
+        dialect = self._detect_dialect()
+        quote = "`" if dialect == "mysql" else '"'
+        param = "%s" if dialect in ("mysql", "postgresql") else "?"
+        table = f"{quote}{self.MIGRATION_HISTORY_TABLE}{quote}"
+        now_expr = "NOW()" if dialect in ("mysql", "postgresql") else "CURRENT_TIMESTAMP"
+
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(
+                f"""
+                INSERT INTO {table}
+                (version, name, direction, status, executed_at, execution_time, checksum, source)
+                VALUES ({param}, {param}, {param}, {param}, {now_expr}, {param}, {param}, {param})
+                """,
+                (
+                    str(version),
+                    name,
+                    direction,
+                    status,
+                    execution_time_ms,
+                    checksum,
+                    source,
+                ),
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            # history 不应该阻塞主流程
+            raise MigrationStorageError(f"记录历史失败: {e}") from e
+        finally:
+            cursor.close()
+
+    def get_history(
+        self,
+        limit: Optional[int] = 50,
+        direction: Optional[str] = None,
+    ) -> List[MigrationHistory]:
+        """
+        查询迁移历史，按执行时间倒序。
+
+        Args:
+            limit: 最近 N 条 (None 表示全部)
+            direction: 过滤方向 'up' | 'down' | None
+        """
+        dialect = self._detect_dialect()
+        quote = "`" if dialect == "mysql" else '"'
+        param = "%s" if dialect in ("mysql", "postgresql") else "?"
+        table = f"{quote}{self.MIGRATION_HISTORY_TABLE}{quote}"
+
+        sql = f"""
+        SELECT id, version, name, direction, status, executed_at, execution_time, checksum, source
+        FROM {table}
+        """
+        conditions = []
+        params: list = []
+        if direction:
+            conditions.append(f"direction = {param}")
+            params.append(direction)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY executed_at DESC, id DESC"
+        if limit:
+            sql += f" LIMIT {param}"
+            params.append(limit)
+
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            return [
+                MigrationHistory(
+                    id=int(row[0]),
+                    version=MigrationVersion.parse(row[1]),
+                    name=row[2],
+                    direction=row[3],
+                    status=row[4],
+                    executed_at=(
+                        row[5]
+                        if isinstance(row[5], datetime)
+                        else datetime.fromisoformat(str(row[5]))
+                    ),
+                    execution_time_ms=int(row[6]),
+                    checksum=row[7],
+                    source=row[8],
+                )
+                for row in rows
+            ]
+        except Exception as e:
+            raise MigrationStorageError(f"查询历史失败: {e}") from e
+        finally:
+            cursor.close()
 
     # ------------------------------------------------------------------
     # 工具方法

@@ -105,6 +105,7 @@ class MigrationExecutor:
         # 配置
         self.dry_run = False
         self.single_transaction = False
+        self.history_source: Optional[str] = None
 
     # ------------------------------------------------------------------
     # 初始化
@@ -113,6 +114,13 @@ class MigrationExecutor:
     def initialize(self) -> None:
         """初始化存储（创建状态表等）"""
         self.storage.initialize()
+        # 第一次初始化时，如果 history_source 没设置, 填一个默认值
+        if self.history_source is None:
+            import socket
+            try:
+                self.history_source = socket.gethostname()
+            except Exception:
+                self.history_source = "unknown"
 
     # ------------------------------------------------------------------
     # 计划生成
@@ -369,6 +377,20 @@ class MigrationExecutor:
                 else:
                     self.storage.delete_migration(script.version)
 
+                # 追加历史记录
+                try:
+                    self.storage.record_history(
+                        version=script.version,
+                        name=script.filename,
+                        direction=direction.value,
+                        status="success",
+                        execution_time_ms=elapsed_ms,
+                        checksum=script.checksum,
+                        source=self.history_source,
+                    )
+                except Exception:
+                    pass
+
             result.status = MigrationStatus.SUCCESS
             if self.on_migration_success:
                 self.on_migration_success(result)
@@ -388,6 +410,35 @@ class MigrationExecutor:
                         checksum=script.checksum,
                         execution_time_ms=elapsed_ms,
                         success=False,
+                    )
+                except Exception:
+                    pass
+
+                # 追加失败历史
+                try:
+                    self.storage.record_history(
+                        version=script.version,
+                        name=script.filename,
+                        direction=direction.value,
+                        status="failed",
+                        execution_time_ms=elapsed_ms,
+                        checksum=script.checksum,
+                        source=self.history_source,
+                    )
+                except Exception:
+                    pass
+
+            if not self.dry_run and direction == MigrationDirection.DOWN:
+                # 回滚失败也记一条历史
+                try:
+                    self.storage.record_history(
+                        version=script.version,
+                        name=script.filename,
+                        direction=direction.value,
+                        status="failed",
+                        execution_time_ms=elapsed_ms,
+                        checksum=script.checksum,
+                        source=self.history_source,
                     )
                 except Exception:
                     pass

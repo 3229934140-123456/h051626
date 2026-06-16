@@ -48,7 +48,8 @@ class MigratorCLI:
         )
 
         # 全局参数 (配置文件/连接/目录)
-        parser.add_argument("--config", "-c", dest="config_path", help="配置文件路径 (默认 migrator.toml)")
+        parser.add_argument("--config", "-c", dest="config_path", help="配置文件路径 (默认自动发现 migrator.toml/yaml)")
+        parser.add_argument("--env", "-e", dest="env", help="环境名 (dev/staging/prod, 从配置 envs.<env> 读)")
         parser.add_argument("--db-url", dest="db_url", help="数据库 URL (覆盖配置文件)")
         parser.add_argument("--dir", dest="migrations_dir", help="迁移脚本目录 (覆盖配置文件)")
         parser.add_argument("--lock-timeout", type=int, dest="lock_timeout", help="锁超时秒数 (覆盖配置文件)")
@@ -117,6 +118,13 @@ class MigratorCLI:
         p_validate = subparsers.add_parser("validate", help="校验迁移完整性")
         p_validate.add_argument("--format", dest="format", choices=["text", "json"], default="text", help="输出格式 (text/json)")
 
+        # history (alias: audit)
+        for cmd_name in ("history", "audit"):
+            p_hist = subparsers.add_parser(cmd_name, help=f"查看迁移执行历史 (audit 为别名)")
+            p_hist.add_argument("--limit", "-n", type=int, default=50, dest="limit", help="显示最近 N 条 (默认 50)")
+            p_hist.add_argument("--direction", dest="direction", choices=["up", "down"], help="只看指定方向")
+            p_hist.add_argument("--format", dest="format", choices=["text", "json"], default="text", help="输出格式 (text/json)")
+
         # generate
         p_gen = subparsers.add_parser("generate", help="从现有 schema 生成迁移")
         p_gen.add_argument("description", help="迁移描述")
@@ -145,12 +153,15 @@ class MigratorCLI:
             existing_overrides["lock_timeout"] = self.lock_timeout
         if self.allow_dirty != _default.allow_dirty:
             existing_overrides["allow_dirty"] = self.allow_dirty
+        if self.config.env != _default.env:
+            existing_overrides["env"] = self.config.env
 
         # 用 CLI 全局参数覆盖配置
         cli_overrides = {
             "db_url": getattr(args, "db_url", None),
             "migrations_dir": getattr(args, "migrations_dir", None),
             "lock_timeout": getattr(args, "lock_timeout", None),
+            "env": getattr(args, "env", None),
         }
         # CLI 参数优先于 existing_overrides
         for k, v in cli_overrides.items():
@@ -161,8 +172,22 @@ class MigratorCLI:
         if allow_dirty_flag:
             existing_overrides["allow_dirty"] = True
 
-        config_path = getattr(args, "config_path", None) or self.config.config_path
-        self.config = load_config(config_path, existing_overrides if existing_overrides else None)
+        try:
+            config_path = getattr(args, "config_path", None) or (
+                self.config.config_path if self.config.config_path != _default.config_path else None
+            )
+            self.config = load_config(
+                config_path,
+                existing_overrides if existing_overrides else None,
+                env_name=existing_overrides.get("env") if "env" in existing_overrides else None,
+            )
+        except FileNotFoundError as e:
+            print(f"\n[CONFIG] {e}", file=sys.stderr)
+            return 5
+        except Exception as e:
+            print(f"\n[CONFIG] 加载配置失败: {type(e).__name__}: {e}", file=sys.stderr)
+            return 5
+
         if allow_dirty_flag:
             self.config.allow_dirty = True
 
@@ -172,7 +197,11 @@ class MigratorCLI:
         self.allow_dirty = self.config.allow_dirty
 
         try:
-            return getattr(self, f"cmd_{args.command}")(args)
+            # history 与 audit 是同一个命令
+            cmd_name = args.command
+            if cmd_name == "audit":
+                cmd_name = "history"
+            return getattr(self, f"cmd_{cmd_name}")(args)
         except MigrationValidationError as e:
             msg = str(e).replace("迁移完整性校验失败:\n", "").strip()
             lines = [ln for ln in msg.splitlines() if ln.strip()]
@@ -472,6 +501,90 @@ class MigratorCLI:
     # plan (迁移计划预览)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 辅助: SQL 风险分析
+    # ------------------------------------------------------------------
+
+    def _extract_table_names(self, sql_list: list) -> list:
+        """从 SQL 语句里粗略提取涉及的表名 (小写去重)"""
+        import re
+        tables = set()
+        patterns = [
+            r"CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"ALTER\s+TABLE\s+[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?\S+\s+ON\s+[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?[`\"\[]?(?:\w+\.)?([A-Za-z_][A-Za-z0-9_]*)",
+            r"INSERT\s+INTO\s+[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"UPDATE\s+[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+            r"DELETE\s+FROM\s+[`\"\[]?([A-Za-z_][A-Za-z0-9_]*)",
+        ]
+        for sql in sql_list:
+            sql_upper = sql.upper()
+            for pat in patterns:
+                for m in re.finditer(pat, sql, re.IGNORECASE):
+                    tables.add(m.group(1).lower())
+        return sorted(tables)
+
+    def _contains_keyword(self, sql_list: list, keywords: list) -> bool:
+        for sql in sql_list:
+            upper = sql.upper()
+            for kw in keywords:
+                if kw in upper:
+                    return True
+        return False
+
+    def _analyze_risk(self, script, direction_enum) -> dict:
+        """
+        分析单个迁移脚本的风险。
+        返回:
+            {
+              "risk_level": "low"|"medium"|"high",
+              "has_drop": bool,
+              "has_alter": bool,
+              "missing_down": bool,
+              "affected_tables": [...],
+              "reason": "..."
+            }
+        """
+        if direction_enum.value == "up":
+            focus_sql = script.up_sql
+        else:
+            focus_sql = script.down_sql
+
+        has_drop = self._contains_keyword(focus_sql, ["DROP TABLE", "DROP COLUMN", "DROP INDEX"])
+        has_alter = self._contains_keyword(focus_sql, ["ALTER TABLE", "ALTER INDEX", "ALTER COLUMN"])
+        missing_down = len(script.down_sql) == 0
+
+        affected = set()
+        affected.update(self._extract_table_names(script.up_sql))
+        affected.update(self._extract_table_names(script.down_sql))
+        affected_tables = sorted(affected)
+
+        if has_drop or missing_down:
+            risk_level = "high"
+            reasons = []
+            if has_drop:
+                reasons.append("含 DROP 操作")
+            if missing_down:
+                reasons.append("缺失 down 回滚脚本")
+            reason = "; ".join(reasons)
+        elif has_alter:
+            risk_level = "medium"
+            reason = "含 ALTER 变更"
+        else:
+            risk_level = "low"
+            reason = ""
+
+        return {
+            "risk_level": risk_level,
+            "has_drop": has_drop,
+            "has_alter": has_alter,
+            "missing_down": missing_down,
+            "affected_tables": affected_tables,
+            "reason": reason,
+        }
+
     def _sql_summary(self, statements: list, max_lines: int) -> str:
         if max_lines <= 0:
             return ""
@@ -501,11 +614,31 @@ class MigratorCLI:
             else:
                 plan = executor.plan_down(target_version=args.target, steps=args.steps)
 
-            # ---- 构建 JSON 数据 ----
+            # 分析每条脚本 + 汇总风险
             items = []
+            total_drop = 0
+            total_alter = 0
+            total_missing_down = 0
+            all_tables: set = set()
+            overall_risk = "low"
+
             for script in plan.scripts:
+                risk = self._analyze_risk(script, direction)
                 up_summary = self._sql_summary(script.up_sql, args.sql_lines)
                 down_summary = self._sql_summary(script.down_sql, args.sql_lines)
+
+                if risk["has_drop"]:
+                    total_drop += 1
+                if risk["has_alter"]:
+                    total_alter += 1
+                if risk["missing_down"]:
+                    total_missing_down += 1
+                all_tables.update(risk["affected_tables"])
+                if risk["risk_level"] == "high":
+                    overall_risk = "high"
+                elif risk["risk_level"] == "medium" and overall_risk != "high":
+                    overall_risk = "medium"
+
                 items.append({
                     "version": str(script.version),
                     "description": script.description,
@@ -516,45 +649,185 @@ class MigratorCLI:
                     "down_statements": len(script.down_sql),
                     "up_sql_preview": up_summary,
                     "down_sql_preview": down_summary,
+                    "risk": risk,
                 })
 
+            risk_summary = {
+                "overall_risk": overall_risk,
+                "count_drop": total_drop,
+                "count_alter": total_alter,
+                "count_missing_down": total_missing_down,
+                "affected_tables": sorted(all_tables),
+                "needs_approval": overall_risk in ("medium", "high"),
+            }
+
+            # ---- 构建 JSON 数据 ----
             json_data = {
                 "direction": direction.value,
                 "count": plan.count,
+                "env": self.config.env,
+                "db_url_masked": self._mask_db_url(self.db_url),
+                "risk_summary": risk_summary,
                 "items": items,
             }
 
             if args.format == "json":
                 print(json.dumps(json_data, ensure_ascii=False, indent=2))
-                return 0
+                # 高风险时退出码非零，便于 CI 拦截
+                return 2 if overall_risk == "high" else (1 if overall_risk == "medium" else 0)
 
             # ---- 文本输出 ----
-            print(f"迁移计划预览: {direction.value.upper()} (共 {plan.count} 个)")
+            env_tag = f" [env={self.config.env}]" if self.config.env != "default" else ""
+            risk_tag = f" [{overall_risk.upper()} RISK]" if overall_risk != "low" else " [LOW RISK]"
+            print(f"迁移计划预览: {direction.value.upper()} (共 {plan.count} 个){env_tag}{risk_tag}")
             print("-" * 70)
             if plan.count == 0:
                 print("  (无待执行迁移)")
                 return 0
 
-            for i, script in enumerate(plan.scripts, 1):
-                arrow = "[UP ]" if direction == MigrationDirection.UP else "[DOWN]"
-                print(f"\n  {i:>2}. {arrow} {script.version}  {script.description}")
-                print(f"      文件: {script.filename}")
-                print(f"      up: {len(script.up_sql)} 语句, down: {len(script.down_sql)} 语句")
+            # 风险摘要头部
+            if total_drop or total_alter or total_missing_down:
+                print("  风险摘要:")
+                if total_missing_down:
+                    print(f"    [!] {total_missing_down} 个脚本缺失 down 回滚 (高风险)")
+                if total_drop:
+                    print(f"    [!] {total_drop} 个脚本含 DROP 操作 (高风险)")
+                if total_alter:
+                    print(f"    [-] {total_alter} 个脚本含 ALTER 变更 (中风险)")
+                if all_tables:
+                    print(f"    影响表: {', '.join(sorted(all_tables))}")
+                print()
 
-                up_preview = self._sql_summary(script.up_sql, args.sql_lines)
+            for i, item in enumerate(items, 1):
+                script_version = item["version"]
+                risk = item["risk"]
+                risk_marker = ""
+                if risk["risk_level"] == "high":
+                    risk_marker = " [HIGH]"
+                elif risk["risk_level"] == "medium":
+                    risk_marker = " [MED]"
+                arrow = "[UP ]" if direction == MigrationDirection.UP else "[DOWN]"
+                print(f"  {i:>2}. {arrow} {script_version}  {item['description']}{risk_marker}")
+                print(f"      文件: {item['filename']}")
+                print(f"      up: {item['up_statements']} 语句, down: {item['down_statements']} 语句")
+                if risk["reason"]:
+                    print(f"      风险: {risk['reason']}")
+                if risk["affected_tables"]:
+                    print(f"      表:  {', '.join(risk['affected_tables'])}")
+
+                up_preview = self._sql_summary(
+                    plan.scripts[i-1].up_sql, args.sql_lines
+                )
                 if up_preview:
                     print(f"      up SQL 预览:")
                     for line in up_preview.splitlines():
                         print(f"        {line}")
 
-                down_preview = self._sql_summary(script.down_sql, args.sql_lines)
+                down_preview = self._sql_summary(
+                    plan.scripts[i-1].down_sql, args.sql_lines
+                )
                 if down_preview:
                     print(f"      down SQL 预览:")
                     for line in down_preview.splitlines():
                         print(f"        {line}")
 
             print()
-            print(f"总计: {plan.count} 个迁移待 {direction.value}")
+            print(f"总计: {plan.count} 个迁移待 {direction.value} | 整体风险: {overall_risk.upper()}")
+            if overall_risk in ("medium", "high"):
+                print(f"[!] 本次迁移存在 {'中高' if overall_risk == 'high' else '中'} 风险操作, 发布前建议人工审批")
+            # medium 退出码 1, high 退出码 2
+            return 2 if overall_risk == "high" else (1 if overall_risk == "medium" else 0)
+        finally:
+            conn.close()
+
+    def _mask_db_url(self, url: str) -> str:
+        """脱敏 db_url (去掉密码)"""
+        if "@" not in url:
+            return url
+        try:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(url)
+            if parsed.username or parsed.password:
+                netloc = ""
+                if parsed.username:
+                    netloc += parsed.username
+                    if parsed.password:
+                        netloc += ":***"
+                if parsed.hostname:
+                    if netloc:
+                        netloc += "@"
+                    netloc += parsed.hostname
+                    if parsed.port:
+                        netloc += f":{parsed.port}"
+                masked = parsed._replace(netloc=netloc)
+                return urlunparse(masked)
+        except Exception:
+            pass
+        return url
+
+    # ------------------------------------------------------------------
+    # history / audit (迁移执行历史)
+    # ------------------------------------------------------------------
+
+    def cmd_history(self, args) -> int:
+        conn = self._connect()
+        try:
+            from migrator.storage import MigrationStorage
+            storage = MigrationStorage(conn)
+            storage.initialize()
+            history = storage.get_history(limit=args.limit, direction=args.direction)
+
+            # JSON 输出
+            if args.format == "json":
+                items = []
+                for h in history:
+                    items.append({
+                        "id": h.id,
+                        "version": str(h.version),
+                        "name": h.name,
+                        "direction": h.direction,
+                        "status": h.status,
+                        "executed_at": self._format_applied_at(h.executed_at),
+                        "execution_time_ms": h.execution_time_ms,
+                        "checksum": h.checksum,
+                        "source": h.source,
+                    })
+                out = {
+                    "env": self.config.env,
+                    "total": len(items),
+                    "limit": args.limit,
+                    "direction_filter": args.direction,
+                    "items": items,
+                }
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+                return 0
+
+            # 文本输出
+            dir_tag = f" (direction={args.direction})" if args.direction else ""
+            env_tag = f" [env={self.config.env}]" if self.config.env != "default" else ""
+            print(f"迁移执行历史: 最近 {min(args.limit, len(history))} 条{dir_tag}{env_tag}")
+            print("-" * 95)
+            if not history:
+                print("  (暂无历史记录)")
+                return 0
+
+            print(f"  {'ID':>4}  {'方向':5}  {'版本':20}  {'状态':8}  {'耗时ms':>7}  {'时间':20}  {'来源'}")
+            print("  " + "-" * 90)
+            for h in history:
+                d = "[UP ]" if h.direction == "up" else "[DOWN]"
+                st = "[OK]" if h.status == "success" else "[FAIL]"
+                src = h.source or "-"
+                print(
+                    f"  {h.id:>4}  {d:5}  {str(h.version):<20}  {st:8}  {h.execution_time_ms:>7}  "
+                    f"{self._format_applied_at(h.executed_at):20}  {src}"
+                )
+                print(f"        脚本: {h.name}")
+
+            total_up = sum(1 for h in history if h.direction == "up")
+            total_down = sum(1 for h in history if h.direction == "down")
+            total_fail = sum(1 for h in history if h.status == "failed")
+            print()
+            print(f"  统计: up={total_up}, down={total_down}, failed={total_fail}")
             return 0
         finally:
             conn.close()

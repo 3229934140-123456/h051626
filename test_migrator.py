@@ -444,13 +444,22 @@ def test_config(tmpdir):
             saved_env[k] = os.environ.pop(k)
 
     try:
-        # 1. 默认值
+        # 1. 默认值 (不传 config_path => 不尝试加载文件, 仅用默认)
         from migrator.config import load_config, MigratorConfig
-        cfg = load_config(config_path=os.path.join(tmpdir, "does_not_exist.toml"))
+        cfg = load_config(config_path=None)
         assert cfg.migrations_dir == "migrations"
         assert cfg.allow_dirty is False
         assert cfg.lock_timeout == 30
         print("  默认值: OK")
+
+        # 1b. 显式传不存在文件 => FileNotFoundError
+        missing = os.path.join(tmpdir, "does_not_exist.toml")
+        try:
+            load_config(config_path=missing)
+            raise AssertionError("应抛 FileNotFoundError")
+        except FileNotFoundError as e:
+            assert "does_not_exist.toml" in str(e)
+            print("  显式 config 不存在抛错: OK")
 
         # 2. 写一个 migrator.toml 并加载
         toml_path = os.path.join(tmpdir, "migrator.toml")
@@ -527,11 +536,12 @@ def test_cli_plan(tmpdir):
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = cli.run(["plan", "up"])
-    assert rc == 0
+    # 迁移目录中 add_user_profile 含 ALTER TABLE => MEDIUM 风险 => rc=1
     output = buf.getvalue()
+    assert rc in (0, 1, 2), f"无效退出码 {rc}"
     assert "迁移计划预览: UP" in output
     assert "文件:" in output
-    print("  plan up text: OK")
+    print(f"  plan up text: OK (rc={rc})")
 
     # plan up --steps 1 --format json
     buf = io.StringIO()
@@ -556,19 +566,25 @@ def test_cli_plan(tmpdir):
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = cli.run(["plan", "down", "--steps", "1", "--format", "json"])
+    # down 1 条 (posts) 的 down_sql 含 DROP TABLE => HIGH 风险, rc=2
     data = json.loads(buf.getvalue())
     assert data["direction"] == "down"
     assert data["count"] == 1
     assert data["items"][0]["direction"] == "down"
-    print(f"  plan down JSON: direction={data['direction']}, count={data['count']}")
+    assert "risk_summary" in data
+    print(f"  plan down JSON: direction={data['direction']}, count={data['count']}, risk={data['risk_summary']['overall_risk']}, rc={rc}")
 
+    # 先把所有都 up 完，确认 plan up count=0
+    cli.run(["up"])
     # plan up 已是最新时应该 count=0
     buf = io.StringIO()
     with redirect_stdout(buf):
         rc = cli.run(["plan", "up", "--format", "json"])
     data = json.loads(buf.getvalue())
-    # 若全部应用完则 count=0
-    print(f"  plan up (已应用后): count={data['count']}")
+    # 全部应用完则 count=0, 风险 low rc=0
+    assert data["count"] == 0, f"count 应为 0, 实际 {data['count']}"
+    assert rc == 0, f"无迁移时 rc=0, 实际 {rc}"
+    print(f"  plan up (已全部应用后): count={data['count']}, rc={rc}")
 
     # --sql-lines 0 => 不输出 SQL 预览
     buf = io.StringIO()
@@ -578,9 +594,349 @@ def test_cli_plan(tmpdir):
     if data["items"]:
         assert data["items"][0]["up_sql_preview"] == ""
         assert data["items"][0]["down_sql_preview"] == ""
-    print("  plan --sql-lines 0: OK")
+    print(f"  plan --sql-lines 0: OK (rc={rc})")
 
     print("  [PASS] CLI plan 命令测试通过")
+
+
+def test_config_envs_yaml(tmpdir):
+    log("Z1. 配置: 环境分组 + YAML + 显式 --config 不串默认")
+
+    # 清掉干扰 env
+    saved_env = {}
+    for k in ["DATABASE_URL", "MIGRATIONS_DIR", "MIGRATOR_ENV", "MIGRATOR_CONFIG"]:
+        if k in os.environ:
+            saved_env[k] = os.environ.pop(k)
+    try:
+        from migrator.config import load_config
+
+        # 1. YAML: envs 分组 + default_env
+        yaml_path = os.path.join(tmpdir, "migrator.yaml")
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.write("""
+migrator:
+  default_env: dev
+
+envs:
+  dev:
+    db_url: "sqlite:///dev.db"
+    migrations_dir: "migrations/dev"
+    lock_timeout: 15
+  staging:
+    db_url: "postgresql://staging-host/staging"
+    migrations_dir: "migrations"
+  prod:
+    db_url: "postgresql://user:secret@prod-db:5432/prod"
+    migrations_dir: "migrations"
+    allow_dirty: false
+    lock_timeout: 120
+""")
+
+        # 默认环境 dev (由 default_env 指定)
+        cfg = load_config(config_path=yaml_path)
+        assert cfg.env == "dev", f"实际 env={cfg.env}"
+        assert cfg.db_url == "sqlite:///dev.db"
+        assert cfg.migrations_dir == "migrations/dev"
+        assert cfg.lock_timeout == 15
+        assert cfg.config_path == yaml_path
+        print("  YAML [envs.dev]: OK")
+
+        # 指定 prod 环境
+        cfg = load_config(config_path=yaml_path, env_name="prod")
+        assert cfg.env == "prod"
+        assert cfg.db_url == "postgresql://user:secret@prod-db:5432/prod"
+        assert cfg.lock_timeout == 120
+        assert cfg.allow_dirty is False
+        print("  YAML [envs.prod]: OK")
+
+        # 用 MIGRATOR_ENV 环境变量指定 staging
+        os.environ["MIGRATOR_ENV"] = "staging"
+        try:
+            cfg = load_config(config_path=yaml_path)
+            assert cfg.env == "staging"
+            assert cfg.db_url == "postgresql://staging-host/staging"
+            print("  MIGRATOR_ENV=staging: OK")
+        finally:
+            del os.environ["MIGRATOR_ENV"]
+
+        # 2. TOML envs section ([envs.dev] 点号嵌套)
+        toml_path = os.path.join(tmpdir, "env.toml")
+        with open(toml_path, "w", encoding="utf-8") as f:
+            f.write("""
+default_env = "dev"
+
+[envs.dev]
+db_url = "sqlite:///toml_dev.db"
+migrations_dir = "toml_mig"
+
+[envs.prod]
+db_url = "postgresql://toml_prod/prod"
+allow_dirty = true
+lock_timeout = 60
+""")
+        cfg = load_config(config_path=toml_path)
+        assert cfg.env == "dev"
+        assert cfg.db_url == "sqlite:///toml_dev.db"
+        cfg = load_config(config_path=toml_path, env_name="prod")
+        assert cfg.env == "prod"
+        assert cfg.allow_dirty is True
+        assert cfg.lock_timeout == 60
+        print("  TOML [envs.*]: OK")
+
+        # 3. 显式 --config 一个不存在的文件 => 应抛 FileNotFoundError
+        missing = os.path.join(tmpdir, "does_not_exist.toml")
+        try:
+            load_config(config_path=missing)
+            raise AssertionError("应抛 FileNotFoundError")
+        except FileNotFoundError as e:
+            assert "does_not_exist.toml" in str(e)
+            assert "只加载指定文件" in str(e)
+            print("  显式 config 不存在: OK (正确抛出 FileNotFoundError)")
+
+        # 4. 显式 config 不应串默认文件: 在当前目录放个假配置, 显式指定 tmpdir 下的
+        #    一个只有 db_url 字段的文件，验证没有被当前目录的假配置影响
+        current_dir_config = os.path.join(os.getcwd(), "migrator.toml")
+        wrote_current = False
+        if not os.path.exists(current_dir_config):
+            with open(current_dir_config, "w", encoding="utf-8") as f:
+                f.write('db_url = "CURRENT_DIR_POISON"\n')
+            wrote_current = True
+        try:
+            isolated = os.path.join(tmpdir, "isolated.yaml")
+            with open(isolated, "w", encoding="utf-8") as f:
+                f.write("db_url: sqlite:///isolated.db\nmigrations_dir: iso_mig\n")
+            cfg = load_config(config_path=isolated)
+            assert cfg.db_url == "sqlite:///isolated.db", f"被当前目录配置串了: {cfg.db_url}"
+            assert cfg.migrations_dir == "iso_mig"
+            print("  显式 config 不串默认: OK")
+        finally:
+            if wrote_current and os.path.exists(current_dir_config):
+                os.remove(current_dir_config)
+
+        print("  [PASS] 环境分组/YAML/显式配置测试通过")
+    finally:
+        for k, v in saved_env.items():
+            os.environ[k] = v
+
+
+def test_cli_plan_risk(tmpdir):
+    log("Z2. CLI plan: 风险分析 (DROP/ALTER/缺失 down/影响表)")
+
+    # 清干扰
+    saved_env = {}
+    for k in ["DATABASE_URL", "MIGRATIONS_DIR", "MIGRATOR_ENV", "MIGRATOR_CONFIG"]:
+        if k in os.environ:
+            saved_env[k] = os.environ.pop(k)
+    try:
+        import io
+        from contextlib import redirect_stdout
+
+        # 临时 migrations 目录: 构造 3 个不同风险等级的脚本
+        mig_dir = os.path.join(tmpdir, "migrations")
+        os.makedirs(mig_dir, exist_ok=True)
+
+        # LOW: 纯建表
+        with open(os.path.join(mig_dir, "20240101000001_low.sql"), "w", encoding="utf-8") as f:
+            f.write("""-- migrate: Description=low risk table
+-- +migrate Up
+CREATE TABLE categories (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+CREATE INDEX idx_categories_name ON categories(name);
+
+-- +migrate Down
+DROP INDEX IF EXISTS idx_categories_name;
+DROP TABLE IF EXISTS categories;
+""")
+
+        # MEDIUM: ALTER TABLE
+        with open(os.path.join(mig_dir, "20240102000001_med.sql"), "w", encoding="utf-8") as f:
+            f.write("""-- migrate: Description=medium alter
+-- +migrate Up
+ALTER TABLE categories ADD COLUMN code TEXT;
+CREATE INDEX idx_categories_code ON categories(code);
+
+-- +migrate Down
+DROP INDEX IF EXISTS idx_categories_code;
+ALTER TABLE categories DROP COLUMN code;
+""")
+
+        # HIGH: 缺失 down + DROP
+        with open(os.path.join(mig_dir, "20240103000001_high.sql"), "w", encoding="utf-8") as f:
+            f.write("""-- migrate: Description=high drop
+-- +migrate Up
+CREATE TABLE tmp_log (id INTEGER PRIMARY KEY);
+DROP TABLE categories;
+""")
+
+        db_path = os.path.join(tmpdir, "plan_risk.db")
+        cli = MigratorCLI()
+        cli.db_url = f"sqlite:///{db_path}"
+        cli.migrations_dir = mig_dir
+
+        cli.run(["init"])
+
+        # 文本模式: 检查有风险提示
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["plan", "up", "--sql-lines", "0"])
+        output = buf.getvalue()
+        assert "OVERALL RISK" in output or "HIGH RISK" in output or "MED" in output, f"无风险标识: {output[:200]}"
+        # 整体 HIGH 风险应该退出码 2
+        assert rc == 2, f"high risk 应退出码 2, 实际 {rc}"
+        assert "DROP" in output
+        assert "ALTER" in output
+        assert "缺失 down 回滚" in output or "missing_down" in output.lower() or "缺失 down" in output
+        print("  文本风险提示: OK (rc=2 HIGH)")
+
+        # JSON 模式: 检查字段结构
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["plan", "up", "--format", "json", "--sql-lines", "0"])
+        assert rc == 2
+        data = json.loads(buf.getvalue())
+        assert "risk_summary" in data
+        rs = data["risk_summary"]
+        assert rs["overall_risk"] == "high"
+        assert rs["count_drop"] >= 1
+        assert rs["count_alter"] >= 1
+        assert rs["count_missing_down"] >= 1
+        assert rs["needs_approval"] is True
+        # 影响表应包含 categories / tmp_log
+        assert "categories" in rs["affected_tables"], f"影响表: {rs['affected_tables']}"
+        assert "tmp_log" in rs["affected_tables"]
+        # 每条脚本应有 risk 字段
+        for it in data["items"]:
+            assert "risk" in it
+            assert "risk_level" in it["risk"]
+            assert "affected_tables" in it["risk"]
+        # 最后一个是 HIGH
+        last = data["items"][-1]
+        assert last["risk"]["risk_level"] == "high"
+        assert last["risk"]["missing_down"] is True
+        # db_url_masked 应该已脱敏
+        assert "***" not in data.get("db_url_masked", "")  # SQLite 没密码, 不脱敏
+        assert "env" in data
+        print(f"  JSON 风险摘要: overall={rs['overall_risk']}, drop={rs['count_drop']}, alter={rs['count_alter']}, missing_down={rs['count_missing_down']}")
+        print(f"  影响表: {rs['affected_tables']}")
+
+        # 单独 --steps 1 只看 LOW: 退出码 0
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["plan", "up", "--steps", "1", "--format", "json", "--sql-lines", "0"])
+        data = json.loads(buf.getvalue())
+        assert data["risk_summary"]["overall_risk"] == "low"
+        assert rc == 0, f"low risk 应退出码 0, 实际 {rc}"
+        print("  --steps 1 LOW 风险: OK (rc=0)")
+
+        # --steps 2: LOW + MED => medium 退出码 1
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["plan", "up", "--steps", "2", "--format", "json", "--sql-lines", "0"])
+        data = json.loads(buf.getvalue())
+        assert data["risk_summary"]["overall_risk"] == "medium"
+        assert rc == 1, f"medium risk 应退出码 1, 实际 {rc}"
+        print("  --steps 2 MED 风险: OK (rc=1)")
+
+        print("  [PASS] CLI plan 风险分析测试通过")
+    finally:
+        for k, v in saved_env.items():
+            os.environ[k] = v
+
+
+def test_cli_history(tmpdir):
+    log("Z3. CLI history/audit: 迁移历史审计 (up/down 记录)")
+
+    saved_env = {}
+    for k in ["DATABASE_URL", "MIGRATIONS_DIR", "MIGRATOR_ENV", "MIGRATOR_CONFIG"]:
+        if k in os.environ:
+            saved_env[k] = os.environ.pop(k)
+    try:
+        import io
+        from contextlib import redirect_stdout
+
+        db_path = os.path.join(tmpdir, "hist.db")
+        cli = MigratorCLI()
+        cli.db_url = f"sqlite:///{db_path}"
+        cli.migrations_dir = "migrations"
+
+        cli.run(["init"])
+
+        # --- 空历史: history & audit 别名 ---
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["history", "--format", "json"])
+        assert rc == 0
+        data = json.loads(buf.getvalue())
+        assert data["total"] == 0
+        assert data["items"] == []
+        print("  history 空: OK")
+
+        # audit 别名也能跑
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["audit", "--limit", "10", "--format", "json"])
+        assert rc == 0
+        data = json.loads(buf.getvalue())
+        assert data["total"] == 0
+        print("  audit 别名: OK")
+
+        # --- up 2 条: 应该生成 2 条 history ---
+        cli.run(["up", "--steps", "2"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["history", "--format", "json"])
+        data = json.loads(buf.getvalue())
+        assert data["total"] == 2, f"up 2 条后应有 2 条 history, 实际 {data['total']}"
+        for it in data["items"]:
+            assert it["direction"] == "up"
+            assert it["status"] == "success"
+            assert "executed_at" in it
+            assert "execution_time_ms" in it
+            assert "source" in it
+            assert it["source"] is not None  # hostname
+        versions = [it["version"] for it in data["items"]]
+        assert versions[0] > versions[1]  # DESC 顺序
+        print(f"  up 2 条 history: {versions}")
+
+        # --- down 1 条: 再生成 1 条 history ---
+        cli.run(["down", "--steps", "1"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["history", "--format", "json"])
+        data = json.loads(buf.getvalue())
+        assert data["total"] == 3
+        latest = data["items"][0]
+        assert latest["direction"] == "down"
+        assert latest["status"] == "success"
+        print(f"  down 1 条 history: latest={latest['version']} direction={latest['direction']}")
+
+        # --- direction 过滤 ---
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["history", "--direction", "down", "--format", "json"])
+        data = json.loads(buf.getvalue())
+        assert data["total"] == 1
+        assert data["items"][0]["direction"] == "down"
+        print("  direction=down 过滤: OK")
+
+        # --- 文本模式 ---
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["history", "--limit", "5"])
+        assert rc == 0
+        text = buf.getvalue()
+        assert "[UP ]" in text
+        assert "[DOWN]" in text
+        assert "[OK]" in text
+        assert "脚本:" in text
+        print("  文本模式输出: OK")
+
+        print("  [PASS] CLI history/audit 测试通过")
+    finally:
+        for k, v in saved_env.items():
+            os.environ[k] = v
 
 
 def test_postgresql_smoke():
@@ -759,6 +1115,9 @@ def main():
         test_cli_validate_json(tmpdir)
         test_config(tmpdir)
         test_cli_plan(tmpdir)
+        test_config_envs_yaml(tmpdir)
+        test_cli_plan_risk(tmpdir)
+        test_cli_history(tmpdir)
         test_postgresql_smoke()
 
         log("所有测试通过!")
