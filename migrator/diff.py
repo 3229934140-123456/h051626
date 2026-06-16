@@ -2,20 +2,10 @@
 Schema 对比模块
 ===============
 
-负责:
-- 从现有数据库提取 schema 定义（表、列、索引、约束）
-- 对比源 schema 与目标 schema 的差异
-- 自动生成迁移脚本 (up/down SQL)
-
-支持的数据库对象:
-    - 表 (TABLE)
-    - 列 (COLUMN) - 数据类型、NULL/NOT NULL、默认值
-    - 主键 (PRIMARY KEY)
-    - 索引 (INDEX)
-    - 外键 (FOREIGN KEY)
-
-注意: 自动生成的迁移脚本需要人工审核，特别是涉及数据丢失的操作（如删除列）。
+负责从现有数据库提取 schema、对比差异、自动生成迁移脚本。
 """
+
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field

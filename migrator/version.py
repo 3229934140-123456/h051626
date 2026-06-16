@@ -3,19 +3,9 @@
 ============
 
 负责迁移版本的解析、比较和排序。
-
-版本格式:
-    - 时间戳格式: YYYYMMDDHHMMSS (推荐)
-        示例: 20240101120000
-    - 语义化版本: MAJOR.MINOR.PATCH
-        示例: 1.0.0
-    - 递增整数: 纯数字
-        示例: 001, 1, 42
-
-版本号从迁移脚本文件名中提取，文件名格式:
-    {version}_{description}.sql
-    示例: 20240101120000_create_users.sql
 """
+
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass

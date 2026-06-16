@@ -3,30 +3,9 @@
 ================
 
 负责解析迁移脚本文件，提取 up/down SQL 语句、描述、校验和等元数据。
-
-迁移脚本格式:
-    -- migrate: description=创建用户表
-    -- migrate: author=dev
-    -- migrate: transaction=true
-
-    -- +migrate Up
-    CREATE TABLE users (
-        id INTEGER PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    -- +migrate Down
-    DROP TABLE users;
-
-指令说明:
-    -- migrate: key=value           元数据注释
-    -- +migrate Up                  标记 up 脚本开始
-    -- +migrate Down                标记 down 脚本开始
-    -- +migrate StatementBegin      标记复合语句开始 (含分号的存储过程等)
-    -- +migrate StatementEnd        标记复合语句结束
 """
+
+from __future__ import annotations
 
 import hashlib
 import os

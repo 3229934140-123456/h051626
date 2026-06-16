@@ -3,16 +3,9 @@
 ======================
 
 运行: python test_migrator.py
-
-本脚本演示:
-1. 版本号解析与排序
-2. 迁移脚本解析
-3. 状态存储初始化
-4. 执行 up/down 迁移
-5. 完整性校验
-6. Schema 对比与迁移生成
-7. 并发锁
 """
+
+from __future__ import annotations
 
 import os
 import shutil

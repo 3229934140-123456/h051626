@@ -2,21 +2,10 @@
 状态存储模块
 ============
 
-负责在数据库中创建和维护迁移状态表，记录已应用的迁移，提供:
-- 迁移状态表 schema_migrations 的自动创建
-- 已应用迁移的增删查
-- 校验和完整性校验 (防止已应用脚本被篡改)
-- 数据库级别的并发锁 (防止多实例同时迁移)
-- 迁移失败标记
-
-schema_migrations 表结构:
-    version          VARCHAR(64)    PRIMARY KEY    -- 迁移版本号
-    name             VARCHAR(255)                   -- 迁移文件名
-    checksum         CHAR(64)                       -- SHA-256 校验和
-    applied_at       TIMESTAMP                      -- 应用时间
-    execution_time   INTEGER                        -- 执行耗时(毫秒)
-    success          BOOLEAN                        -- 是否成功(失败标记)
+负责在数据库中创建和维护迁移状态表，记录已应用的迁移，提供并发锁。
 """
+
+from __future__ import annotations
 
 import time
 import uuid
@@ -96,9 +85,12 @@ class MigrationStorage:
 
     def _create_migrations_table(self, cursor, dialect: str) -> None:
         """创建 schema_migrations 表"""
+        q = "`" if dialect == "mysql" else '"'
+        table = f"{q}{self.SCHEMA_MIGRATIONS_TABLE}{q}"
+
         if dialect == "mysql":
-            ddl = f"""
-            CREATE TABLE IF NOT EXISTS `{self.SCHEMA_MIGRATIONS_TABLE}` (
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
                 `version` VARCHAR(64) NOT NULL PRIMARY KEY,
                 `name` VARCHAR(255) NOT NULL,
                 `checksum` CHAR(64) NOT NULL,
@@ -108,40 +100,53 @@ class MigrationStorage:
                 INDEX `idx_success` (`success`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
+            cursor.execute(create_table)
+
         elif dialect == "postgresql":
-            ddl = f"""
-            CREATE TABLE IF NOT EXISTS "{self.SCHEMA_MIGRATIONS_TABLE}" (
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
                 version VARCHAR(64) NOT NULL PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
                 checksum CHAR(64) NOT NULL,
                 applied_at TIMESTAMP NOT NULL,
                 execution_time INTEGER NOT NULL DEFAULT 0,
                 success BOOLEAN NOT NULL DEFAULT TRUE
-            );
-            CREATE INDEX IF NOT EXISTS idx_{self.SCHEMA_MIGRATIONS_TABLE}_success
-                ON "{self.SCHEMA_MIGRATIONS_TABLE}" (success);
+            )
             """
+            cursor.execute(create_table)
+            create_index = f"""
+            CREATE INDEX IF NOT EXISTS idx_{self.SCHEMA_MIGRATIONS_TABLE}_success
+                ON {table} (success)
+            """
+            cursor.execute(create_index)
+
         else:
             # SQLite
-            ddl = f"""
-            CREATE TABLE IF NOT EXISTS "{self.SCHEMA_MIGRATIONS_TABLE}" (
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
                 version TEXT NOT NULL PRIMARY KEY,
                 name TEXT NOT NULL,
                 checksum TEXT NOT NULL,
                 applied_at TIMESTAMP NOT NULL,
                 execution_time INTEGER NOT NULL DEFAULT 0,
                 success INTEGER NOT NULL DEFAULT 1 CHECK (success IN (0, 1))
-            );
-            CREATE INDEX IF NOT EXISTS idx_schema_migrations_success
-                ON "{self.SCHEMA_MIGRATIONS_TABLE}" (success);
+            )
             """
-        cursor.executescript(ddl) if dialect != "mysql" else cursor.execute(ddl)
+            cursor.execute(create_table)
+            create_index = f"""
+            CREATE INDEX IF NOT EXISTS idx_schema_migrations_success
+                ON {table} (success)
+            """
+            cursor.execute(create_index)
 
     def _create_lock_table(self, cursor, dialect: str) -> None:
         """创建锁表"""
+        q = "`" if dialect == "mysql" else '"'
+        table = f"{q}{self.MIGRATION_LOCK_TABLE}{q}"
+
         if dialect == "mysql":
-            ddl = f"""
-            CREATE TABLE IF NOT EXISTS `{self.MIGRATION_LOCK_TABLE}` (
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
                 `id` INTEGER NOT NULL PRIMARY KEY,
                 `locked` TINYINT(1) NOT NULL DEFAULT 0,
                 `owner` VARCHAR(64),
@@ -149,40 +154,58 @@ class MigrationStorage:
                 INDEX `idx_locked` (`locked`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
+            cursor.execute(create_table)
+
         elif dialect == "postgresql":
-            ddl = f"""
-            CREATE TABLE IF NOT EXISTS "{self.MIGRATION_LOCK_TABLE}" (
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
                 id INTEGER NOT NULL PRIMARY KEY,
                 locked BOOLEAN NOT NULL DEFAULT FALSE,
                 owner VARCHAR(64),
                 locked_at TIMESTAMP
-            );
+            )
             """
+            cursor.execute(create_table)
+
         else:
-            ddl = f"""
-            CREATE TABLE IF NOT EXISTS "{self.MIGRATION_LOCK_TABLE}" (
+            # SQLite
+            create_table = f"""
+            CREATE TABLE IF NOT EXISTS {table} (
                 id INTEGER NOT NULL PRIMARY KEY,
                 locked INTEGER NOT NULL DEFAULT 0 CHECK (locked IN (0, 1)),
                 owner TEXT,
                 locked_at TIMESTAMP
-            );
+            )
             """
-        cursor.executescript(ddl) if dialect != "mysql" else cursor.execute(ddl)
+            cursor.execute(create_table)
 
     def _init_lock_record(self, cursor, dialect: str) -> None:
         """确保锁表中有一条初始记录"""
-        quote = "`" if dialect == "mysql" else '"'
+        q = "`" if dialect == "mysql" else '"'
+        table = f"{q}{self.MIGRATION_LOCK_TABLE}{q}"
+
         if dialect == "mysql":
             cursor.execute(
-                f"INSERT IGNORE INTO `{self.MIGRATION_LOCK_TABLE}` (id, locked) VALUES (%s, 0)",
+                f"INSERT IGNORE INTO {table} (id, locked) VALUES (%s, 0)",
+                (self.LOCK_ID,),
+            )
+        elif dialect == "postgresql":
+            cursor.execute(
+                f"""
+                INSERT INTO {table} (id, locked)
+                VALUES (%s, FALSE)
+                ON CONFLICT (id) DO NOTHING
+                """,
                 (self.LOCK_ID,),
             )
         else:
+            # SQLite
             cursor.execute(
                 f"""
-                INSERT OR IGNORE INTO {quote}{self.MIGRATION_LOCK_TABLE}{quote} (id, locked)
-                VALUES ({self.LOCK_ID}, 0)
-                """
+                INSERT OR IGNORE INTO {table} (id, locked)
+                VALUES (?, 0)
+                """,
+                (self.LOCK_ID,),
             )
 
     # ------------------------------------------------------------------

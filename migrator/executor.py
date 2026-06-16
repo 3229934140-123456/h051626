@@ -2,18 +2,15 @@
 执行引擎模块
 ============
 
-负责迁移的实际执行:
-- 按版本顺序 up 迁移
-- 按版本逆序 down 回滚
-- 事务包裹（支持按迁移或按语句粒度）
-- 执行失败处理 (标记失败或事务回滚)
-- 执行钩子回调
+负责迁移的实际执行、事务包裹、失败处理。
 """
+
+from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 from .exceptions import MigrationExecutionError, MigrationValidationError
 from .parser import MigrationParser, MigrationScript

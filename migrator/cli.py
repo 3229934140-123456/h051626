@@ -2,20 +2,10 @@
 命令行接口
 ==========
 
-使用示例:
-    python -m migrator init                    # 初始化迁移环境
-    python -m migrator create create_users     # 创建新迁移脚本
-    python -m migrator up                      # 执行所有待应用迁移
-    python -m migrator up --steps 2            # 应用接下来 2 个迁移
-    python -m migrator up --to 20240101120000  # 应用到指定版本
-    python -m migrator down                    # 回滚最后一个迁移
-    python -m migrator down --steps 3          # 回滚最近 3 个迁移
-    python -m migrator down --to 20240101120000
-    python -m migrator redo                    # 回滚并重做最后一个迁移
-    python -m migrator status                  # 查看迁移状态
-    python -m migrator validate                # 校验迁移完整性
-    python -m migrator generate                # 从现有 schema 生成迁移
+迁移工具命令行入口。
 """
+
+from __future__ import annotations
 
 import argparse
 import os
@@ -29,6 +19,7 @@ from .executor import MigrationExecutor, MigrationStatus
 from .parser import MigrationParser
 from .storage import MigrationStorage
 from .version import MigrationVersion
+from .exceptions import MigrationValidationError, MigrationLockError
 
 
 class MigratorCLI:
@@ -101,26 +92,124 @@ class MigratorCLI:
         args = self.parser.parse_args(argv)
         try:
             return getattr(self, f"cmd_{args.command}")(args)
-        except Exception as e:
-            print(f"[ERROR] {e}", file=sys.stderr)
+        except MigrationValidationError as e:
+            # 把 validator 抛的异常拆分成人能读的清单
+            msg = str(e).replace("迁移完整性校验失败:\n", "").strip()
+            lines = [ln for ln in msg.splitlines() if ln.strip()]
+            print("\n[FAIL] 无法继续，迁移完整性校验未通过:", file=sys.stderr)
+            for ln in lines:
+                print(f"  - {ln.lstrip()}", file=sys.stderr)
+            print("\n提示: 先运行 `migrator status` 和 `migrator validate` 查看详情。", file=sys.stderr)
             return 1
+        except MigrationLockError as e:
+            print(f"\n[LOCK] {e}", file=sys.stderr)
+            return 2
+        except NotImplementedError as e:
+            print(f"\n[UNSUPPORTED] {e}", file=sys.stderr)
+            return 3
+        except RuntimeError as e:
+            print(f"\n[ERROR] {e}", file=sys.stderr)
+            return 4
+        except Exception as e:
+            print(f"\n[ERROR] 未处理异常: {type(e).__name__}: {e}", file=sys.stderr)
+            return 99
 
     # ------------------------------------------------------------------
     # 数据库连接
     # ------------------------------------------------------------------
 
     def _connect(self):
-        """根据 DATABASE_URL 建立连接（简化版：仅 SQLite）"""
-        if self.db_url.startswith("sqlite:///"):
-            db_path = self.db_url[len("sqlite:///"):]
+        """
+        根据 DATABASE_URL 建立连接
+
+        支持的 URL 格式:
+            sqlite:///./app.db
+            postgresql://user:pass@host:5432/dbname
+            postgres://user:pass@host:5432/dbname
+            mysql://user:pass@host:3306/dbname
+        """
+        url = self.db_url
+
+        if url.startswith("sqlite:///"):
+            db_path = url[len("sqlite:///"):]
             os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+            import sqlite3
             conn = sqlite3.connect(db_path)
             conn.execute("PRAGMA foreign_keys = ON")
             return conn
-        # 其他数据库需扩展
+
+        if url.startswith("postgresql://") or url.startswith("postgres://"):
+            try:
+                import psycopg2
+            except ImportError as e:
+                raise RuntimeError(
+                    "需要 psycopg2 库: pip install psycopg2-binary"
+                ) from e
+            # psycopg2 的 connect 接受 libpq 风格的 URI，原生支持 postgresql://
+            conn = psycopg2.connect(url)
+            conn.autocommit = False
+            return conn
+
+        if url.startswith("mysql://") or url.startswith("mysql+pymysql://"):
+            try:
+                import pymysql
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                conn = pymysql.connect(
+                    host=parsed.hostname or "127.0.0.1",
+                    port=parsed.port or 3306,
+                    user=parsed.username or "root",
+                    password=parsed.password or "",
+                    database=parsed.path.lstrip("/"),
+                    charset="utf8mb4",
+                )
+                return conn
+            except ImportError as e:
+                raise RuntimeError(
+                    "需要 PyMySQL 库: pip install PyMySQL"
+                ) from e
+
         raise NotImplementedError(
-            f"暂不支持的数据库 URL: {self.db_url}。请手动扩展 _connect() 方法。"
+            f"暂不支持的数据库 URL: {url}。"
+            "支持: sqlite:///、postgresql://、mysql://"
         )
+
+    # ------------------------------------------------------------------
+    # 辅助方法
+    # ------------------------------------------------------------------
+
+    def _print_failed_banner(self, failed: list) -> None:
+        """打印失败迁移的醒目横幅"""
+        if not failed:
+            return
+        print()
+        print("+" + "-" * 68 + "+")
+        print("|  [!] 检测到失败的迁移记录！后续迁移已暂停")
+        print("|")
+        for m in failed:
+            print(f"|  [X] 版本 {m.version}  {m.name}")
+        print("|")
+        print("|  处理方式:")
+        print("|    1. 修复失败的脚本后，手动在数据库中 UPDATE schema_migrations")
+        print("|       将 success 置为 1，或者删除该记录后重新执行")
+        print("|    2. 或者手动回滚该版本造成的部分变更，然后删掉这条失败记录")
+        print("|    3. 修复完成后再执行 up 继续后续迁移")
+        print("+" + "-" * 68 + "+")
+        print()
+
+    def _classify_validation_errors(self, errors: list):
+        """把 validate 的错误分类"""
+        failed_records = []
+        checksum_errors = []
+        missing_scripts = []
+        for e in errors:
+            if "标记为失败状态" in e:
+                failed_records.append(e)
+            elif "找不到对应脚本" in e:
+                missing_scripts.append(e)
+            else:
+                checksum_errors.append(e)
+        return failed_records, missing_scripts, checksum_errors
 
     # ------------------------------------------------------------------
     # 命令实现
@@ -177,6 +266,13 @@ class MigratorCLI:
             executor.initialize()
             executor.dry_run = args.dry_run
 
+            # 先检查有没有失败的迁移，有就直接停下并提示
+            failed = executor.storage.get_failed_migrations()
+            if failed:
+                print("[STOP] 存在失败的迁移记录，已拒绝执行新的迁移。")
+                self._print_failed_banner(failed)
+                return 1
+
             # 注册钩子
             def on_start(script, direction):
                 print(f"[UP ] {script.version}  {script.description}")
@@ -186,7 +282,11 @@ class MigratorCLI:
                 print(f"      OK ({t}ms)")
 
             def on_failure(result):
-                print(f"[FAIL] {result.error}")
+                print(f"[FAIL] 版本 {result.version} 执行失败:")
+                if result.error:
+                    # 按行缩进，方便人眼定位
+                    for line in result.error.splitlines():
+                        print(f"       {line}")
 
             executor.on_migration_start = on_start
             executor.on_migration_success = on_success
@@ -200,9 +300,22 @@ class MigratorCLI:
             finally:
                 executor.storage.release_lock()
 
-            failed = [r for r in results if r.status == MigrationStatus.FAILED]
-            print(f"\n完成: {len(results) - len(failed)} 成功, {len(failed)} 失败")
-            return 1 if failed else 0
+            success_count = sum(1 for r in results if r.status == MigrationStatus.SUCCESS)
+            failed_count = sum(1 for r in results if r.status == MigrationStatus.FAILED)
+            dry_tag = " (dry-run)" if args.dry_run else ""
+
+            print(f"\n完成{dry_tag}: {success_count} 成功, {failed_count} 失败")
+            if failed_count:
+                failed_results = [r for r in results if r.status == MigrationStatus.FAILED]
+                # 从状态表里取出失败记录，打印统一的横幅
+                try:
+                    failed = executor.storage.get_failed_migrations()
+                    if failed:
+                        self._print_failed_banner(failed)
+                except Exception:
+                    pass
+                return 1
+            return 0
 
         finally:
             conn.close()
@@ -223,7 +336,10 @@ class MigratorCLI:
                 print(f"      OK ({t}ms)")
 
             def on_failure(result):
-                print(f"[FAIL] {result.error}")
+                print(f"[FAIL] 版本 {result.version} 回滚失败:")
+                if result.error:
+                    for line in result.error.splitlines():
+                        print(f"       {line}")
 
             executor.on_migration_start = on_start
             executor.on_migration_success = on_success
@@ -235,9 +351,11 @@ class MigratorCLI:
             finally:
                 executor.storage.release_lock()
 
-            failed = [r for r in results if r.status == MigrationStatus.FAILED]
-            print(f"\n完成: {len(results) - len(failed)} 成功, {len(failed)} 失败")
-            return 1 if failed else 0
+            success_count = sum(1 for r in results if r.status == MigrationStatus.SUCCESS)
+            failed_count = sum(1 for r in results if r.status == MigrationStatus.FAILED)
+            dry_tag = " (dry-run)" if args.dry_run else ""
+            print(f"\n完成{dry_tag}: {success_count} 成功, {failed_count} 失败")
+            return 1 if failed_count else 0
 
         finally:
             conn.close()
@@ -249,6 +367,12 @@ class MigratorCLI:
             executor = MigrationExecutor(conn, self.migrations_dir)
             executor.initialize()
 
+            failed = executor.storage.get_failed_migrations()
+            if failed:
+                print("[STOP] 存在失败的迁移记录，已拒绝执行 redo。请先处理失败记录。")
+                self._print_failed_banner(failed)
+                return 1
+
             executor.storage.acquire_lock()
             try:
                 results = executor.redo(steps=args.steps)
@@ -256,10 +380,14 @@ class MigratorCLI:
                 executor.storage.release_lock()
 
             for r in results:
-                print(f"[{r.direction.value.upper():4}] {r.version}  {r.status.value}")
+                tag = "OK" if r.status == MigrationStatus.SUCCESS else "FAIL"
+                print(f"[{r.direction.value.upper():4}] {r.version}  {tag} ({r.execution_time_ms}ms)")
+                if r.status == MigrationStatus.FAILED and r.error:
+                    for line in r.error.splitlines():
+                        print(f"       {line}")
 
-            failed = [r for r in results if r.status == MigrationStatus.FAILED]
-            return 1 if failed else 0
+            failed_results = [r for r in results if r.status == MigrationStatus.FAILED]
+            return 1 if failed_results else 0
 
         finally:
             conn.close()
@@ -271,28 +399,48 @@ class MigratorCLI:
             executor = MigrationExecutor(conn, self.migrations_dir)
             executor.initialize()
             st = executor.status()
-
-            print(f"总脚本数:    {st['total_scripts']}")
-            print(f"已应用:      {st['applied_count']}")
-            print(f"待应用:      {st['pending_count']}")
-            print(f"失败:        {st['failed_count']}")
-            print(f"当前版本:    {st['latest_version'] or '(无)'}")
-
-            # 列出最近几个已应用的
             applied = executor.storage.get_applied_migrations()
+            failed = executor.storage.get_failed_migrations()
+
+            # 摘要
+            latest = st['latest_version']
+            latest_str = f"{latest}" if latest else "(无)"
+            pending_str = f"{st['pending_count']}" if st['pending_count'] else "0 (已是最新)"
+            failed_str = f"{st['failed_count']}  [!] 需要处理!" if st['failed_count'] else "0"
+
+            print("迁移状态概览")
+            print("-" * 40)
+            print(f"总脚本数:   {st['total_scripts']}")
+            print(f"已应用:     {st['applied_count']}")
+            print(f"待应用:     {pending_str}")
+            print(f"失败记录:   {failed_str}")
+            print(f"当前版本:   {latest_str}")
+
+            # 失败记录优先展示，最醒目
+            if failed:
+                self._print_failed_banner(failed)
+
+            # 已应用迁移 (最多显示最近 20 条)
             if applied:
-                print("\n已应用迁移:")
-                for m in applied[-10:]:
-                    status = "OK" if m.success else "FAILED"
-                    print(f"  {m.version}  {status:6}  {m.name}")
+                print("\n已应用迁移 (最近20条):")
+                for m in applied[-20:]:
+                    tag = "[OK] " if m.success else "[FAIL]"
+                    time_str = m.applied_at.strftime("%Y-%m-%d %H:%M:%S") if hasattr(m.applied_at, "strftime") else str(m.applied_at)
+                    print(
+                        f"  {tag}  {str(m.version):<20}  "
+                        f"{time_str}  ({m.execution_time_ms}ms)  {m.name}"
+                    )
+                if len(applied) > 20:
+                    print(f"  ... 还有 {len(applied) - 20} 条历史迁移")
 
             if st["pending_versions"]:
-                print("\n待应用迁移:")
+                print("\n待应用迁移 (按执行顺序):")
                 scripts = executor.parser.parse_directory()
                 applied_versions = {m.version for m in applied}
-                for s in scripts:
-                    if s.version not in applied_versions:
-                        print(f"  {s.version}  {s.description}")
+                pending = [s for s in scripts if s.version not in applied_versions]
+                pending.sort(key=lambda s: s.version)
+                for s in pending:
+                    print(f"  [->] {s.version}  {s.description}")
 
             return 0
         finally:
@@ -305,14 +453,42 @@ class MigratorCLI:
             executor = MigrationExecutor(conn, self.migrations_dir)
             executor.initialize()
             errors = executor.validate()
-            if errors:
-                print("[FAIL] 校验失败:")
-                for e in errors:
-                    print(f"  - {e}")
-                return 1
-            else:
+            failed_records, missing_scripts, checksum_errors = self._classify_validation_errors(errors)
+
+            total = len(errors)
+            if total == 0:
                 print("[OK] 所有迁移校验通过")
+                print("   - 已应用脚本 checksum 与磁盘文件一致")
+                print("   - 无失败的迁移记录")
                 return 0
+
+            print("[FAIL] 迁移完整性校验失败\n")
+
+            if failed_records:
+                print(f"[!] 失败迁移 ({len(failed_records)} 条):")
+                for e in failed_records:
+                    print(f"    - {e}")
+                print("  -> 需要先处理失败记录（手动回滚部分变更 + 删除/修正失败记录）")
+                print()
+
+            if missing_scripts:
+                print(f"[!] 已应用但缺少脚本文件 ({len(missing_scripts)} 条):")
+                for e in missing_scripts:
+                    print(f"    - {e}")
+                print("  -> 请恢复对应版本的脚本文件，或确认该迁移可以删除后手动清库")
+                print()
+
+            if checksum_errors:
+                print(f"[!] 脚本内容被篡改/不匹配 ({len(checksum_errors)} 条):")
+                for e in checksum_errors:
+                    for i, line in enumerate(e.splitlines()):
+                        prefix = "    - " if i == 0 else "      "
+                        print(f"{prefix}{line}")
+                print("  -> 恢复原始脚本内容；如果确实需要修改，请先回滚该版本再重新应用")
+                print()
+
+            print("详细故障排查请运行: migrator status")
+            return 1
         finally:
             conn.close()
 
