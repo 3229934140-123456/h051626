@@ -470,17 +470,20 @@ class MigrationExecutor:
         """
         scripts = self.parser.parse_directory()
         applied_list = self.storage.get_applied_migrations()
-        applied = {m.version: m for m in applied_list}
-
-        pending_versions = [s.version for s in scripts if s.version not in applied]
+        all_applied_map = {m.version: m for m in applied_list}
+        success_applied = [m for m in applied_list if m.success]
         failed = [m for m in applied_list if not m.success]
+        success_applied_map = {m.version: m for m in success_applied}
+
+        pending_versions = [s.version for s in scripts if s.version not in all_applied_map]
 
         return {
             "total_scripts": len(scripts),
-            "applied_count": len(applied_list),
+            "applied_count": len(success_applied),
             "pending_count": len(pending_versions),
             "failed_count": len(failed),
-            "latest_version": max(applied.keys()) if applied else None,
+            "latest_version": max(success_applied_map.keys()) if success_applied_map else None,
+            "success_applied": success_applied,
             "failed": failed,
             "pending_versions": pending_versions,
         }

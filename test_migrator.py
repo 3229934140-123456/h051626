@@ -434,8 +434,157 @@ def test_cli_validate_json(tmpdir):
     print("  [PASS] CLI validate JSON 测试通过")
 
 
+def test_config(tmpdir):
+    log("X. 配置文件与优先级测试")
+
+    # 测试期间避免用户本地 DATABASE_URL 等干扰
+    saved_env = {}
+    for k in ["DATABASE_URL", "MIGRATIONS_DIR", "MIGRATOR_LOCK_TIMEOUT", "MIGRATOR_ALLOW_DIRTY", "MIGRATOR_CONFIG"]:
+        if k in os.environ:
+            saved_env[k] = os.environ.pop(k)
+
+    try:
+        # 1. 默认值
+        from migrator.config import load_config, MigratorConfig
+        cfg = load_config(config_path=os.path.join(tmpdir, "does_not_exist.toml"))
+        assert cfg.migrations_dir == "migrations"
+        assert cfg.allow_dirty is False
+        assert cfg.lock_timeout == 30
+        print("  默认值: OK")
+
+        # 2. 写一个 migrator.toml 并加载
+        toml_path = os.path.join(tmpdir, "migrator.toml")
+        with open(toml_path, "w", encoding="utf-8") as f:
+            f.write("""
+[migrator]
+db_url = "postgresql://localhost/test"
+migrations_dir = "db/migrations"
+lock_timeout = 60
+allow_dirty = true
+""")
+        cfg = load_config(config_path=toml_path)
+        assert cfg.db_url == "postgresql://localhost/test", f"实际: {cfg.db_url}"
+        assert cfg.migrations_dir == "db/migrations"
+        assert cfg.lock_timeout == 60
+        assert cfg.allow_dirty is True
+        assert cfg.config_path == toml_path
+        print("  TOML 加载: OK")
+
+        # 3. 环境变量覆盖
+        os.environ["MIGRATIONS_DIR"] = "env_migrations"
+        os.environ["MIGRATOR_LOCK_TIMEOUT"] = "90"
+        os.environ["MIGRATOR_ALLOW_DIRTY"] = "false"
+        try:
+            cfg = load_config(config_path=toml_path)
+            assert cfg.migrations_dir == "env_migrations", f"实际: {cfg.migrations_dir}"
+            assert cfg.lock_timeout == 90, f"实际: {cfg.lock_timeout}"
+            assert cfg.allow_dirty is False, f"实际: {cfg.allow_dirty}"
+            print("  环境变量覆盖: OK")
+        finally:
+            del os.environ["MIGRATIONS_DIR"]
+            del os.environ["MIGRATOR_LOCK_TIMEOUT"]
+            del os.environ["MIGRATOR_ALLOW_DIRTY"]
+
+        # 4. CLI 覆盖最高
+        cfg = load_config(
+            config_path=toml_path,
+            cli_overrides={"db_url": "sqlite:///cli.db", "migrations_dir": "cli_migrations", "lock_timeout": 120},
+        )
+        assert cfg.db_url == "sqlite:///cli.db"
+        assert cfg.migrations_dir == "cli_migrations"
+        assert cfg.lock_timeout == 120
+        print("  CLI 覆盖: OK")
+
+        # 5. 扁平 TOML 布局 (无 [migrator] section)
+        flat_path = os.path.join(tmpdir, "flat.toml")
+        with open(flat_path, "w", encoding="utf-8") as f:
+            f.write('db_url = "sqlite:///flat.db"\nmigrations_dir = "flat_migrations"\n')
+        cfg = load_config(config_path=flat_path)
+        assert cfg.db_url == "sqlite:///flat.db"
+        assert cfg.migrations_dir == "flat_migrations"
+        print("  扁平 TOML: OK")
+
+        print("  [PASS] 配置文件优先级测试通过")
+    finally:
+        for k, v in saved_env.items():
+            os.environ[k] = v
+
+
+def test_cli_plan(tmpdir):
+    log("Y. CLI plan 命令测试")
+
+    db_path = os.path.join(tmpdir, "plan_test.db")
+    cli = MigratorCLI()
+    cli.migrations_dir = "migrations"
+    cli.db_url = f"sqlite:///{db_path}"
+
+    import io
+    from contextlib import redirect_stdout
+
+    cli.run(["init"])
+
+    # plan up text
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.run(["plan", "up"])
+    assert rc == 0
+    output = buf.getvalue()
+    assert "迁移计划预览: UP" in output
+    assert "文件:" in output
+    print("  plan up text: OK")
+
+    # plan up --steps 1 --format json
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.run(["plan", "up", "--steps", "1", "--format", "json", "--sql-lines", "1"])
+    assert rc == 0
+    data = json.loads(buf.getvalue())
+    assert data["direction"] == "up"
+    assert data["count"] == 1
+    assert len(data["items"]) == 1
+    item = data["items"][0]
+    assert "version" in item
+    assert "description" in item
+    assert "filename" in item
+    assert item["direction"] == "up"
+    assert item["up_statements"] >= 1
+    assert "up_sql_preview" in item
+    print(f"  plan up JSON: direction={data['direction']}, count={data['count']}, first_version={item['version']}")
+
+    # 先 up 两条, 再 plan down
+    cli.run(["up", "--steps", "2"])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.run(["plan", "down", "--steps", "1", "--format", "json"])
+    data = json.loads(buf.getvalue())
+    assert data["direction"] == "down"
+    assert data["count"] == 1
+    assert data["items"][0]["direction"] == "down"
+    print(f"  plan down JSON: direction={data['direction']}, count={data['count']}")
+
+    # plan up 已是最新时应该 count=0
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.run(["plan", "up", "--format", "json"])
+    data = json.loads(buf.getvalue())
+    # 若全部应用完则 count=0
+    print(f"  plan up (已应用后): count={data['count']}")
+
+    # --sql-lines 0 => 不输出 SQL 预览
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = cli.run(["plan", "down", "--format", "json", "--sql-lines", "0"])
+    data = json.loads(buf.getvalue())
+    if data["items"]:
+        assert data["items"][0]["up_sql_preview"] == ""
+        assert data["items"][0]["down_sql_preview"] == ""
+    print("  plan --sql-lines 0: OK")
+
+    print("  [PASS] CLI plan 命令测试通过")
+
+
 def test_postgresql_smoke():
-    log("10. PostgreSQL 连接验收测试 (需要 psycopg2 + PG 实例)")
+    log("10. PostgreSQL 命令行链路验收测试 (需要 psycopg2 + PG 实例)")
 
     pg_url = os.environ.get("PG_TEST_URL")
     if not pg_url:
@@ -450,26 +599,37 @@ def test_postgresql_smoke():
         print("  跳过: psycopg2 未安装 (pip install psycopg2-binary)")
         return
 
-    from migrator.storage import MigrationStorage
+    import io
+    from contextlib import redirect_stdout
 
     print(f"  连接: {pg_url.split('@')[-1] if '@' in pg_url else pg_url}")
-    conn = psycopg2.connect(pg_url)
-    conn.autocommit = False
+
+    # 用独立的临时迁移目录, 避免与默认目录混用
+    tmp_migrations = tempfile.mkdtemp(prefix="pg_migrations_")
+
+    cli = MigratorCLI()
+    cli.db_url = pg_url
+    cli.migrations_dir = tmp_migrations
 
     try:
-        # 清理上次测试残留
+        # ---- 清理上次测试残留 (直接用 psycopg2) ----
+        conn = psycopg2.connect(pg_url)
+        conn.autocommit = False
         cur = conn.cursor()
         cur.execute("DROP TABLE IF EXISTS schema_migrations_lock CASCADE")
         cur.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
         conn.commit()
         cur.close()
+        conn.close()
+        print("  [OK] 清理残留表完成")
 
-        # init
-        storage = MigrationStorage(conn)
-        storage.initialize()
-        print("  [OK] init: 建表成功")
+        # ---- 1. CLI init ----
+        rc = cli.run(["init"])
+        assert rc == 0, f"init 退出码应为 0, 实际 {rc}"
+        print("  [OK] cli init: 退出码 0")
 
         # 验证表已创建
+        conn = psycopg2.connect(pg_url)
         cur = conn.cursor()
         cur.execute(
             "SELECT table_name FROM information_schema.tables "
@@ -478,71 +638,109 @@ def test_postgresql_smoke():
         )
         tables = [r[0] for r in cur.fetchall()]
         cur.close()
+        conn.close()
         assert "schema_migrations" in tables, f"schema_migrations 未创建, 实际: {tables}"
         assert "schema_migrations_lock" in tables, f"schema_migrations_lock 未创建, 实际: {tables}"
         print(f"  [OK] 建表验证: {tables}")
 
-        # status (空库)
-        applied = storage.get_applied_migrations()
-        assert len(applied) == 0
-        print(f"  [OK] status: 空库, 已应用 0 条")
+        # ---- 2. CLI status (JSON) ----
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["status", "--format", "json"])
+        output = buf.getvalue()
+        assert rc == 0, f"status 退出码应为 0, 实际 {rc}. 输出: {output[:200]}"
+        data = json.loads(output)
+        assert data["summary"]["applied_count"] == 0
+        assert data["summary"]["pending_count"] == 0
+        assert data["summary"]["failed_count"] == 0
+        assert data["summary"]["latest_version"] is None
+        assert len(data["applied"]) == 0
+        print(f"  [OK] cli status JSON: applied={data['summary']['applied_count']}, pending={data['summary']['pending_count']}, failed={data['summary']['failed_count']}")
 
-        # validate (空库)
-        errors = storage.validate_checksums({})
-        assert len(errors) == 0
-        print(f"  [OK] validate: 空库校验通过")
+        # ---- 3. CLI validate (JSON) ----
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["validate", "--format", "json"])
+        output = buf.getvalue()
+        assert rc == 0, f"validate 退出码应为 0, 实际 {rc}. 输出: {output[:200]}"
+        data = json.loads(output)
+        assert data["valid"] is True
+        assert data["error_count"] == 0
+        assert data["summary"]["failed_migrations"] == 0
+        assert data["summary"]["missing_scripts"] == 0
+        assert data["summary"]["checksum_mismatches"] == 0
+        print(f"  [OK] cli validate JSON: valid={data['valid']}, error_count={data['error_count']}")
 
-        # 插入一条模拟记录
+        # ---- 4. 插入一条失败记录, 验证 status/validate 返回退出码 1 ----
+        from migrator.storage import MigrationStorage
+        from migrator.version import MigrationVersion
+
+        conn = psycopg2.connect(pg_url)
+        conn.autocommit = False
+        storage = MigrationStorage(conn)
+        storage.initialize()
         storage.record_migration(
-            version=MigrationVersion.parse("20240101000001"),
-            name="20240101000001_create_users.sql",
-            checksum="abc123",
-            execution_time_ms=42,
-            success=True,
-        )
-        applied = storage.get_applied_migrations()
-        assert len(applied) == 1
-        assert applied[0].success is True
-        print(f"  [OK] 插入记录: version={applied[0].version}, success={applied[0].success}")
-
-        # 插入失败记录
-        storage.record_migration(
-            version=MigrationVersion.parse("20240102000001"),
-            name="20240102000001_failed.sql",
-            checksum="def456",
+            version=MigrationVersion.parse("20240199999999"),
+            name="20240199999999_broken.sql",
+            checksum="deadbeef" * 8,
             execution_time_ms=99,
             success=False,
         )
-        failed = storage.get_failed_migrations()
-        assert len(failed) == 1
-        print(f"  [OK] 失败记录: version={failed[0].version}, success={failed[0].success}")
+        conn.commit()
+        conn.close()
+        print("  [OK] 插入失败模拟记录")
 
-        # 删除记录
-        storage.delete_migration(MigrationVersion.parse("20240101000001"))
-        applied = storage.get_applied_migrations()
-        assert len(applied) == 1
-        print(f"  [OK] 删除记录后: 剩余 {len(applied)} 条")
+        # status --failed (text) + 退出码 1
+        rc = cli.run(["status", "--failed"])
+        assert rc == 1, f"status --failed 有失败记录时应退出码 1, 实际 {rc}"
+        print("  [OK] cli status --failed 有失败记录时退出码 1")
 
-        # 锁测试
-        storage.acquire_lock(timeout=5)
-        print(f"  [OK] 获取锁成功")
-        storage.release_lock()
-        print(f"  [OK] 释放锁成功")
+        # status JSON 中 applied_count 不应包含失败记录
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["status", "--format", "json"])
+        data = json.loads(buf.getvalue())
+        assert data["summary"]["applied_count"] == 0, f"失败记录不应计入 applied_count, 实际 {data['summary']['applied_count']}"
+        assert data["summary"]["failed_count"] == 1
+        assert len(data["applied"]) == 0
+        assert len(data["failed"]) == 1
+        print(f"  [OK] status 分组口径: applied={data['summary']['applied_count']}, failed={data['summary']['failed_count']}")
 
-        # 清理
+        # validate JSON 应报告失败迁移
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.run(["validate", "--format", "json"])
+        data = json.loads(buf.getvalue())
+        assert data["valid"] is False
+        assert data["summary"]["failed_migrations"] == 1
+        assert rc == 1
+        print(f"  [OK] validate JSON 识别失败迁移: failed_migrations={data['summary']['failed_migrations']}")
+
+        # ---- 清理 ----
+        conn = psycopg2.connect(pg_url)
         cur = conn.cursor()
         cur.execute("DROP TABLE IF EXISTS schema_migrations_lock CASCADE")
         cur.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
         conn.commit()
         cur.close()
+        conn.close()
 
-        print("  [PASS] PostgreSQL 验收测试通过")
+        print("  [PASS] PostgreSQL CLI 链路验收测试通过")
 
     except Exception as e:
-        conn.rollback()
+        try:
+            conn = psycopg2.connect(pg_url)
+            cur = conn.cursor()
+            cur.execute("DROP TABLE IF EXISTS schema_migrations_lock CASCADE")
+            cur.execute("DROP TABLE IF EXISTS schema_migrations CASCADE")
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
         raise
     finally:
-        conn.close()
+        shutil.rmtree(tmp_migrations, ignore_errors=True)
 
 
 def main():
@@ -559,6 +757,8 @@ def main():
         test_cli_create_templates(tmpdir)
         test_cli_status_filters(tmpdir)
         test_cli_validate_json(tmpdir)
+        test_config(tmpdir)
+        test_cli_plan(tmpdir)
         test_postgresql_smoke()
 
         log("所有测试通过!")

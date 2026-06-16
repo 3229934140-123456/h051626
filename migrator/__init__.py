@@ -16,6 +16,7 @@ from .storage import MigrationStorage
 from .executor import MigrationExecutor
 from .diff import SchemaDiffer
 from .templates import TEMPLATES, render_template, list_templates
+from .config import MigratorConfig, load_config
 
 __version__ = "1.0.0"
 __all__ = [
@@ -28,4 +29,6 @@ __all__ = [
     "TEMPLATES",
     "render_template",
     "list_templates",
+    "MigratorConfig",
+    "load_config",
 ]

@@ -22,6 +22,7 @@ from .storage import MigrationStorage
 from .version import MigrationVersion
 from .exceptions import MigrationValidationError, MigrationLockError
 from .templates import TEMPLATES, render_template, list_templates
+from .config import MigratorConfig, load_config
 
 
 class MigratorCLI:
@@ -29,8 +30,12 @@ class MigratorCLI:
 
     def __init__(self):
         self.parser = self._build_parser()
-        self.migrations_dir = os.environ.get("MIGRATIONS_DIR", "migrations")
-        self.db_url = os.environ.get("DATABASE_URL", "sqlite:///./app.db")
+        # 预先加载默认值，便于测试时直接覆盖属性
+        self.config: MigratorConfig = load_config()
+        self.migrations_dir = self.config.migrations_dir
+        self.db_url = self.config.db_url
+        self.lock_timeout = self.config.lock_timeout
+        self.allow_dirty = self.config.allow_dirty
 
     # ------------------------------------------------------------------
     # 参数解析
@@ -41,6 +46,14 @@ class MigratorCLI:
             prog="migrator",
             description="SQL 数据库迁移工具",
         )
+
+        # 全局参数 (配置文件/连接/目录)
+        parser.add_argument("--config", "-c", dest="config_path", help="配置文件路径 (默认 migrator.toml)")
+        parser.add_argument("--db-url", dest="db_url", help="数据库 URL (覆盖配置文件)")
+        parser.add_argument("--dir", dest="migrations_dir", help="迁移脚本目录 (覆盖配置文件)")
+        parser.add_argument("--lock-timeout", type=int, dest="lock_timeout", help="锁超时秒数 (覆盖配置文件)")
+        parser.add_argument("--allow-dirty", action="store_true", dest="allow_dirty", help="允许脏库继续迁移 (存在失败记录时仍允许 up)")
+
         subparsers = parser.add_subparsers(dest="command", required=True)
 
         # init
@@ -92,6 +105,14 @@ class MigratorCLI:
         p_status.add_argument("--applied", action="store_true", help="只看已应用迁移")
         p_status.add_argument("--format", dest="format", choices=["text", "json"], default="text", help="输出格式 (text/json)")
 
+        # plan
+        p_plan = subparsers.add_parser("plan", help="预览将要执行的 up/down 迁移计划 (dry-run 不执行)")
+        p_plan.add_argument("direction", nargs="?", default="up", choices=["up", "down"], help="迁移方向 (默认 up)")
+        p_plan.add_argument("--steps", type=int, help="执行步数")
+        p_plan.add_argument("--to", dest="target", help="目标版本")
+        p_plan.add_argument("--format", dest="format", choices=["text", "json"], default="text", help="输出格式 (text/json)")
+        p_plan.add_argument("--sql-lines", type=int, default=3, dest="sql_lines", help="每个方向显示多少条 SQL 摘要 (默认 3, 0 表示不显示)")
+
         # validate
         p_validate = subparsers.add_parser("validate", help="校验迁移完整性")
         p_validate.add_argument("--format", dest="format", choices=["text", "json"], default="text", help="输出格式 (text/json)")
@@ -112,6 +133,44 @@ class MigratorCLI:
 
     def run(self, argv: Optional[List[str]] = None) -> int:
         args = self.parser.parse_args(argv)
+
+        # 记录调用前已被外部代码显式设置的值 (用于保持向后兼容的测试方式)
+        _default = MigratorConfig()
+        existing_overrides = {}
+        if self.db_url != _default.db_url:
+            existing_overrides["db_url"] = self.db_url
+        if self.migrations_dir != _default.migrations_dir:
+            existing_overrides["migrations_dir"] = self.migrations_dir
+        if self.lock_timeout != _default.lock_timeout:
+            existing_overrides["lock_timeout"] = self.lock_timeout
+        if self.allow_dirty != _default.allow_dirty:
+            existing_overrides["allow_dirty"] = self.allow_dirty
+
+        # 用 CLI 全局参数覆盖配置
+        cli_overrides = {
+            "db_url": getattr(args, "db_url", None),
+            "migrations_dir": getattr(args, "migrations_dir", None),
+            "lock_timeout": getattr(args, "lock_timeout", None),
+        }
+        # CLI 参数优先于 existing_overrides
+        for k, v in cli_overrides.items():
+            if v is not None:
+                existing_overrides[k] = v
+
+        allow_dirty_flag = getattr(args, "allow_dirty", False)
+        if allow_dirty_flag:
+            existing_overrides["allow_dirty"] = True
+
+        config_path = getattr(args, "config_path", None) or self.config.config_path
+        self.config = load_config(config_path, existing_overrides if existing_overrides else None)
+        if allow_dirty_flag:
+            self.config.allow_dirty = True
+
+        self.migrations_dir = self.config.migrations_dir
+        self.db_url = self.config.db_url
+        self.lock_timeout = self.config.lock_timeout
+        self.allow_dirty = self.config.allow_dirty
+
         try:
             return getattr(self, f"cmd_{args.command}")(args)
         except MigrationValidationError as e:
@@ -294,10 +353,12 @@ class MigratorCLI:
             executor.dry_run = args.dry_run
 
             failed = executor.storage.get_failed_migrations()
-            if failed:
+            if failed and not self.allow_dirty:
                 print("[STOP] 存在失败的迁移记录，已拒绝执行新的迁移。")
                 self._print_failed_banner(failed)
                 return 1
+            if failed and self.allow_dirty:
+                print(f"[WARN] 允许脏库继续: 检测到 {len(failed)} 条失败迁移记录 (--allow-dirty)")
 
             def on_start(script, direction):
                 print(f"[UP ] {script.version}  {script.description}")
@@ -315,7 +376,7 @@ class MigratorCLI:
             executor.on_migration_success = on_success
             executor.on_migration_failure = on_failure
 
-            executor.storage.acquire_lock()
+            executor.storage.acquire_lock(timeout=self.lock_timeout)
             try:
                 results = executor.up(target_version=args.target, steps=args.steps)
             finally:
@@ -361,7 +422,7 @@ class MigratorCLI:
             executor.on_migration_success = on_success
             executor.on_migration_failure = on_failure
 
-            executor.storage.acquire_lock()
+            executor.storage.acquire_lock(timeout=self.lock_timeout)
             try:
                 results = executor.down(target_version=args.target, steps=args.steps)
             finally:
@@ -382,12 +443,14 @@ class MigratorCLI:
             executor.initialize()
 
             failed = executor.storage.get_failed_migrations()
-            if failed:
+            if failed and not self.allow_dirty:
                 print("[STOP] 存在失败的迁移记录，已拒绝执行 redo。请先处理失败记录。")
                 self._print_failed_banner(failed)
                 return 1
+            if failed and self.allow_dirty:
+                print(f"[WARN] 允许脏库继续: 检测到 {len(failed)} 条失败迁移记录 (--allow-dirty)")
 
-            executor.storage.acquire_lock()
+            executor.storage.acquire_lock(timeout=self.lock_timeout)
             try:
                 results = executor.redo(steps=args.steps)
             finally:
@@ -406,6 +469,97 @@ class MigratorCLI:
             conn.close()
 
     # ------------------------------------------------------------------
+    # plan (迁移计划预览)
+    # ------------------------------------------------------------------
+
+    def _sql_summary(self, statements: list, max_lines: int) -> str:
+        if max_lines <= 0:
+            return ""
+        shown = statements[:max_lines]
+        lines = []
+        for s in shown:
+            snippet = s.strip()
+            if len(snippet) > 120:
+                snippet = snippet[:117] + "..."
+            lines.append(snippet)
+        if len(statements) > max_lines:
+            lines.append(f"... 省略 {len(statements) - max_lines} 条语句")
+        return "\n".join(lines)
+
+    def cmd_plan(self, args) -> int:
+        from .executor import MigrationDirection
+
+        conn = self._connect()
+        try:
+            executor = MigrationExecutor(conn, self.migrations_dir)
+            executor.initialize()
+
+            direction = MigrationDirection.UP if args.direction == "up" else MigrationDirection.DOWN
+
+            if direction == MigrationDirection.UP:
+                plan = executor.plan_up(target_version=args.target, steps=args.steps)
+            else:
+                plan = executor.plan_down(target_version=args.target, steps=args.steps)
+
+            # ---- 构建 JSON 数据 ----
+            items = []
+            for script in plan.scripts:
+                up_summary = self._sql_summary(script.up_sql, args.sql_lines)
+                down_summary = self._sql_summary(script.down_sql, args.sql_lines)
+                items.append({
+                    "version": str(script.version),
+                    "description": script.description,
+                    "filename": script.filename,
+                    "direction": direction.value,
+                    "checksum": script.checksum,
+                    "up_statements": len(script.up_sql),
+                    "down_statements": len(script.down_sql),
+                    "up_sql_preview": up_summary,
+                    "down_sql_preview": down_summary,
+                })
+
+            json_data = {
+                "direction": direction.value,
+                "count": plan.count,
+                "items": items,
+            }
+
+            if args.format == "json":
+                print(json.dumps(json_data, ensure_ascii=False, indent=2))
+                return 0
+
+            # ---- 文本输出 ----
+            print(f"迁移计划预览: {direction.value.upper()} (共 {plan.count} 个)")
+            print("-" * 70)
+            if plan.count == 0:
+                print("  (无待执行迁移)")
+                return 0
+
+            for i, script in enumerate(plan.scripts, 1):
+                arrow = "[UP ]" if direction == MigrationDirection.UP else "[DOWN]"
+                print(f"\n  {i:>2}. {arrow} {script.version}  {script.description}")
+                print(f"      文件: {script.filename}")
+                print(f"      up: {len(script.up_sql)} 语句, down: {len(script.down_sql)} 语句")
+
+                up_preview = self._sql_summary(script.up_sql, args.sql_lines)
+                if up_preview:
+                    print(f"      up SQL 预览:")
+                    for line in up_preview.splitlines():
+                        print(f"        {line}")
+
+                down_preview = self._sql_summary(script.down_sql, args.sql_lines)
+                if down_preview:
+                    print(f"      down SQL 预览:")
+                    for line in down_preview.splitlines():
+                        print(f"        {line}")
+
+            print()
+            print(f"总计: {plan.count} 个迁移待 {direction.value}")
+            return 0
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
     # status (增强: 分组 + 过滤 + JSON)
     # ------------------------------------------------------------------
 
@@ -417,11 +571,12 @@ class MigratorCLI:
             st = executor.status()
             applied = executor.storage.get_applied_migrations()
             failed = executor.storage.get_failed_migrations()
+            success_applied = [m for m in applied if m.success]
 
             scripts = executor.parser.parse_directory()
-            applied_versions = {m.version for m in applied}
+            all_applied_versions = {m.version for m in applied}
             pending = sorted(
-                [s for s in scripts if s.version not in applied_versions],
+                [s for s in scripts if s.version not in all_applied_versions],
                 key=lambda s: s.version,
             )
 
@@ -443,7 +598,7 @@ class MigratorCLI:
                         "execution_time_ms": m.execution_time_ms,
                         "success": m.success,
                     }
-                    for m in applied
+                    for m in success_applied
                 ],
                 "pending": [
                     {
